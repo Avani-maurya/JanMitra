@@ -24,6 +24,7 @@ Responsibilities:
 - Eligibility criteria
 - Scheme matching/recommendation logic
 - Scheme module APIs
+- Backend Services
 
 Branch:
 feature/scheme-recommendation
@@ -50,16 +51,15 @@ Responsibilities:
 Branch:
 feature/voice-assistant
 
-### Member 5 — Civic Reporting + Backend
+### Member 5 — Civic Reporting  AI Assistant
 Responsibilities:
 - Civic issue reporting
 - Complaint APIs
 - Database integration
 - Authentication
-- Backend services
-
+  
 Branch:
-feature/civic-backend
+feature/civic-ai
 
 ### Member 6 — Frontend + UI/UX + Testing
 Responsibilities:
