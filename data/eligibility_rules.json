@@ -1,0 +1,21 @@
+{
+  "eligibility_rules": [
+    {
+      "id": "rule_pmkisan",
+      "scheme_id": "scheme_pmkisan",
+      "conditions": [
+        {
+          "field": "is_farmer",
+          "operator": "==",
+          "value": true
+        },
+        {
+          "field": "landholding_status",
+          "operator": "==",
+          "value": true
+        }
+      ],
+      "logic": "AND"
+    }
+  ]
+}
