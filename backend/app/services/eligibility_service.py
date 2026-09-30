@@ -8,7 +8,12 @@ def get_field_value(user: User, field: str) -> Any:
     return getattr(user, field, None)
 
 
-def evaluate_condition(user: User, field: str, operator: str, expected: Any) -> bool:
+def evaluate_condition(
+    user: User,
+    field: str,
+    operator: str,
+    expected: Any
+) -> bool:
     actual = get_field_value(user, field)
 
     if actual is None:
@@ -60,21 +65,63 @@ def evaluate_rule(user: User, rule: EligibilityRule) -> bool:
 
     raise ValueError(f"Unsupported rule logic: {rule.logic}")
 
+
+def get_condition_status(
+    user: User,
+    field: str,
+    operator: str,
+    expected: Any
+) -> tuple[str, Any]:
+    actual = get_field_value(user, field)
+
+    if actual is None:
+        return "UNKNOWN", actual
+
+    matched = evaluate_condition(
+        user,
+        field,
+        operator,
+        expected,
+    )
+
+    return ("MATCHED" if matched else "NOT_MATCHED"), actual
+
+
+def combine_statuses(statuses: list[str], logic: str) -> str:
+    if logic == "AND":
+        if "NOT_MATCHED" in statuses:
+            return "NOT_MATCHED"
+
+        if "UNKNOWN" in statuses:
+            return "UNKNOWN"
+
+        return "MATCHED"
+
+    if logic == "OR":
+        if "MATCHED" in statuses:
+            return "MATCHED"
+
+        if "UNKNOWN" in statuses:
+            return "UNKNOWN"
+
+        return "NOT_MATCHED"
+
+    raise ValueError(f"Unsupported rule logic: {logic}")
+
+
 def evaluate_rule_with_details(user: User, rule: EligibilityRule) -> dict:
     results = []
+    statuses = []
 
     for condition in rule.conditions:
-        actual = get_field_value(user, condition.field)
+        status, actual = get_condition_status(
+            user,
+            condition.field,
+            condition.operator,
+            condition.value,
+        )
 
-        if actual is None:
-            matched = False
-        else:
-            matched = evaluate_condition(
-                user,
-                condition.field,
-                condition.operator,
-                condition.value,
-            )
+        statuses.append(status)
 
         results.append(
             {
@@ -82,16 +129,15 @@ def evaluate_rule_with_details(user: User, rule: EligibilityRule) -> dict:
                 "operator": condition.operator,
                 "expected": condition.value,
                 "actual": actual,
-                "matched": matched,
+                "matched": status == "MATCHED",
+                "status": status,
             }
         )
 
-    if rule.logic == "AND":
-        eligible = all(item["matched"] for item in results)
-    else:
-        eligible = any(item["matched"] for item in results)
+    overall_status = combine_statuses(statuses, rule.logic)
 
     return {
-        "eligible": eligible,
+        "eligible": overall_status == "MATCHED",
+        "status": overall_status,
         "conditions": results,
     }
