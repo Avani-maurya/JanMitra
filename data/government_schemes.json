@@ -1,0 +1,20 @@
+{
+"schemes":[ {
+      "id": "scheme_pmkisan",
+      "name": "Pradhan Mantri Kisan Samman Nidhi (PM-KISAN)",
+      "description": "Income support scheme for eligible farmer families.",
+      "ministry": "Ministry of Agriculture and Farmers Welfare",
+      "category": "Agriculture",
+      "level": "Central",
+      "state": null,
+      "benefits": [
+        "Income support of Rs. 6,000 per year in three equal installments, subject to scheme conditions"
+      ],
+      "application_url": "https://pmkisan.gov.in/",
+      "official_source": "https://pmkisan.gov.in/",
+      "documents_required": [],
+      "eligibility_rule_id": "rule_pmkisan",
+      "status": "active",
+      "last_verified": "2026-09-28"
+    }]
+}
