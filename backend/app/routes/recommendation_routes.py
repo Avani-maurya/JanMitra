@@ -12,6 +12,4 @@ router = APIRouter(
 
 @router.post("")
 def recommend_schemes(user: User):
-    return {
-        "recommendations": get_recommendations(user)
-    }
+    return get_recommendations(user)
