@@ -5,8 +5,23 @@ from backend.app.models.user import User
 from backend.app.services.eligibility_service import evaluate_rule_with_details
 
 
-def get_recommendations(user: User) -> list[dict]:
+def build_scheme_result(scheme: dict, result: dict) -> dict:
+    return {
+        "scheme_id": scheme["id"],
+        "name": scheme["name"],
+        "description": scheme["description"],
+        "category": scheme["category"],
+        "level": scheme["level"],
+        "benefits": scheme["benefits"],
+        "application_url": scheme["application_url"],
+        "match_status": result["status"],
+        "match_details": result["conditions"],
+    }
+
+
+def get_recommendations(user: User) -> dict:
     recommendations = []
+    needs_more_information = []
 
     schemes = get_all_active_schemes()
 
@@ -20,18 +35,15 @@ def get_recommendations(user: User) -> list[dict]:
 
         result = evaluate_rule_with_details(user, rule)
 
-        if result["eligible"]:
-            recommendations.append(
-                {
-                    "scheme_id": scheme["id"],
-                    "name": scheme["name"],
-                    "description": scheme["description"],
-                    "category": scheme["category"],
-                    "level": scheme["level"],
-                    "benefits": scheme["benefits"],
-                    "application_url": scheme["application_url"],
-                    "match_details": result["conditions"],
-                }
-            )
+        scheme_result = build_scheme_result(scheme, result)
 
-    return recommendations
+        if result["status"] == "MATCHED":
+            recommendations.append(scheme_result)
+
+        elif result["status"] == "UNKNOWN":
+            needs_more_information.append(scheme_result)
+
+    return {
+        "recommendations": recommendations,
+        "needs_more_information": needs_more_information,
+    }

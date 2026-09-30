@@ -1,5 +1,6 @@
 {
-"schemes":[ {
+  "schemes": [
+    {
       "id": "scheme_pmkisan",
       "name": "Pradhan Mantri Kisan Samman Nidhi (PM-KISAN)",
       "description": "Income support scheme for eligible farmer families.",
@@ -16,5 +17,24 @@
       "eligibility_rule_id": "rule_pmkisan",
       "status": "active",
       "last_verified": "2026-09-28"
-    }]
+    },
+    {
+      "id": "scheme_pre_matric_disability",
+      "name": "Pre-Matric Scholarship for Students with Disabilities",
+      "description": "Scholarship support for eligible students with disabilities studying in Classes IX and X.",
+      "ministry": "Department of Empowerment of Persons with Disabilities",
+      "category": "Education",
+      "level": "Central",
+      "state": null,
+      "benefits": [
+        "Scholarship assistance subject to scheme conditions"
+      ],
+      "application_url": "https://scholarships.gov.in/",
+      "official_source": "https://depwd.gov.in/en/scholership-schemes-pre-matric/",
+      "documents_required": [],
+      "eligibility_rule_id": "rule_pre_matric_disability",
+      "status": "active",
+      "last_verified": "2026-09-30"
+    }
+  ]
 }

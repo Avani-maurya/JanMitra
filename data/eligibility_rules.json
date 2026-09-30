@@ -16,6 +16,43 @@
         }
       ],
       "logic": "AND"
+    },
+    {
+      "id": "rule_pre_matric_disability",
+      "scheme_id": "scheme_pre_matric_disability",
+      "conditions": [
+        {
+          "field": "is_student",
+          "operator": "==",
+          "value": true
+        },
+        {
+          "field": "school_class",
+          "operator": ">=",
+          "value": 9
+        },
+        {
+          "field": "school_class",
+          "operator": "<=",
+          "value": 10
+        },
+        {
+          "field": "is_disabled",
+          "operator": "==",
+          "value": true
+        },
+        {
+          "field": "disability_percentage",
+          "operator": ">=",
+          "value": 40
+        },
+        {
+          "field": "annual_income",
+          "operator": "<=",
+          "value": 250000
+        }
+      ],
+      "logic": "AND"
     }
   ]
 }

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 
@@ -28,9 +28,14 @@ class User(BaseModel):
     landholding_status: bool | None = None
 
     is_student: bool = False
+    school_class: int | None = Field(default=None, ge=1, le=12)
 
     is_urban: bool | None = None
     owns_pucca_house: bool | None = None
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
