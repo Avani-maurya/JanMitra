@@ -1,20 +1,13 @@
-"""
-JanMitra AI - Chatbot & NLP  (single-file edition)
-==================================================
-Backend only (no frontend). Run in the VS Code terminal:
+"""JanMitra AI - chatbot service.
 
-    pip install fastapi "uvicorn[standard]" google-genai python-dotenv motor
+Pure service layer: NLP, scheme matching for chat context, chat storage
+(MongoDB with in-memory fallback), Gemini wrapper and the chat orchestration.
+It does NOT create a FastAPI app - HTTP endpoints live in
+app/routes/chatbot_routes.py and are mounted by app/main.py.
 
-    python janmitra_chatbot.py            -> chat with the bot in the terminal (for testing)
-    python janmitra_chatbot.py --serve    -> start the REST API for your project's frontend
-                                             (POST /api/chat/message, docs at /docs)
-
-Optional settings (environment variables or a .env file next to this file):
-    GEMINI_API_KEY   your Gemini key (https://aistudio.google.com/apikey)  - without it, rule-based replies are used
-    GEMINI_MODEL     default "gemini-3.8-flash"
-    MONGODB_URI      MongoDB Atlas connection string - without it, chats are kept in memory
-    MONGODB_DB       default janmitra
-    PORT             default 8000
+Terminal chat (no server needed), from the project root (the JanMitra folder
+that contains backend/):
+    python -m backend.app.services.chatbot_service
 """
 from __future__ import annotations
 
@@ -24,19 +17,12 @@ import logging
 import os
 import re
 import sys
-import time
 import uuid
-import argparse
-from collections import defaultdict, deque
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
-import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 try:  # .env support is optional
@@ -45,11 +31,9 @@ try:  # .env support is optional
 except ImportError:
     pass
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
 
 # =========================================================================== #
-# 1. CONFIG
+# 1. CONFIG  (named get_chatbot_settings so it can't clash with main's settings)
 # =========================================================================== #
 
 def _split(value: str) -> list[str]:
@@ -57,26 +41,24 @@ def _split(value: str) -> list[str]:
 
 
 @dataclass(frozen=True)
-class Settings:
+class ChatbotSettings:
     gemini_api_key: str
     gemini_model: str
     gemini_timeout: float
     mongodb_uri: str
     mongodb_db: str
-    cors_origins: list
     rate_limit_per_minute: int
     session_ttl_days: int
 
 
 @lru_cache
-def get_settings() -> Settings:
-    return Settings(
+def get_chatbot_settings() -> ChatbotSettings:
+    return ChatbotSettings(
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip(),
         gemini_timeout=float(os.getenv("GEMINI_TIMEOUT_SECONDS", "20")),
         mongodb_uri=os.getenv("MONGODB_URI", "").strip(),
         mongodb_db=os.getenv("MONGODB_DB", "janmitra").strip(),
-        cors_origins=_split(os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000,http://localhost:8000")),
         rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "30")),
         session_ttl_days=int(os.getenv("SESSION_TTL_DAYS", "30")),
     )
@@ -140,382 +122,8 @@ class AnalyzeRequest(BaseModel):
 
 
 # =========================================================================== #
-# 3. BUILT-IN SCHEME DATA (starter set - verify on official portals & extend)
+# 3. NLP: language detection, intent, entity extraction (offline)
 # =========================================================================== #
-SEED_SCHEMES = json.loads(r'''
-[
- {
-  "id": "pm-kisan",
-  "name": "PM-KISAN Samman Nidhi",
-  "aliases": [
-   "pm kisan",
-   "pmkisan",
-   "kisan samman nidhi",
-   "पीएम किसान",
-   "किसान सम्मान निधि"
-  ],
-  "benefit": "Income support of Rs 6,000 per year, paid in three instalments directly to the bank account.",
-  "description": "Central scheme giving direct income support to eligible farmer families.",
-  "documents": [
-   "Aadhaar",
-   "Land ownership records",
-   "Bank account details"
-  ],
-  "apply_url": "https://pmkisan.gov.in",
-  "eligibility": {
-   "occupations": [
-    "farmer"
-   ]
-  }
- },
- {
-  "id": "pmfby",
-  "name": "PM Fasal Bima Yojana",
-  "aliases": [
-   "fasal bima",
-   "pmfby",
-   "crop insurance",
-   "फसल बीमा"
-  ],
-  "benefit": "Crop insurance cover against yield loss from natural calamities, pests and disease at low farmer premium.",
-  "description": "Insurance scheme protecting farmers against crop loss.",
-  "documents": [
-   "Aadhaar",
-   "Land or sharecropper records",
-   "Bank account details",
-   "Sowing declaration"
-  ],
-  "apply_url": "https://pmfby.gov.in",
-  "eligibility": {
-   "occupations": [
-    "farmer"
-   ]
-  }
- },
- {
-  "id": "ab-pmjay",
-  "name": "Ayushman Bharat PM-JAY",
-  "aliases": [
-   "ayushman bharat",
-   "pmjay",
-   "pm-jay",
-   "ayushman card",
-   "आयुष्मान भारत",
-   "आयुष्मान कार्ड"
-  ],
-  "benefit": "Health cover of up to Rs 5 lakh per family per year for hospitalisation at empanelled hospitals.",
-  "description": "Health assurance scheme for economically weaker families. Actual eligibility is decided from official deprivation/occupation criteria (SECC data), so please verify on the portal.",
-  "documents": [
-   "Aadhaar",
-   "Ration card",
-   "Family ID / mobile number"
-  ],
-  "apply_url": "https://pmjay.gov.in",
-  "eligibility": {
-   "max_income": 300000
-  }
- },
- {
-  "id": "ab-pmjay-vvy",
-  "name": "Ayushman Vay Vandana (70+ health cover)",
-  "aliases": [
-   "vay vandana",
-   "ayushman vay vandana",
-   "आयुष्मान वय वंदना"
-  ],
-  "benefit": "Health cover of Rs 5 lakh per year for citizens aged 70 and above.",
-  "description": "Extension of PM-JAY that covers senior citizens aged 70+ irrespective of income.",
-  "documents": [
-   "Aadhaar",
-   "Age proof"
-  ],
-  "apply_url": "https://pmjay.gov.in",
-  "eligibility": {
-   "min_age": 70
-  }
- },
- {
-  "id": "nsp-post-matric-sc",
-  "name": "Post Matric Scholarship for SC Students",
-  "aliases": [
-   "post matric scholarship",
-   "sc scholarship",
-   "पोस्ट मैट्रिक छात्रवृत्ति"
-  ],
-  "benefit": "Financial assistance covering maintenance allowance and fees for SC students in post-matric courses.",
-  "description": "Scholarship for Scheduled Caste students, applied through the National Scholarship Portal.",
-  "documents": [
-   "Caste certificate",
-   "Income certificate",
-   "Aadhaar",
-   "Marksheets",
-   "Bank account details",
-   "Admission proof"
-  ],
-  "apply_url": "https://scholarships.gov.in",
-  "eligibility": {
-   "occupations": [
-    "student"
-   ],
-   "categories": [
-    "SC"
-   ],
-   "max_income": 250000
-  }
- },
- {
-  "id": "csss",
-  "name": "Central Sector Scholarship Scheme (CSSS)",
-  "aliases": [
-   "csss",
-   "central sector scholarship",
-   "merit scholarship"
-  ],
-  "benefit": "Merit-based annual scholarship for college and university students from low-income families.",
-  "description": "Scholarship for students above the Class 12 cut-off from families with limited income; apply on the National Scholarship Portal.",
-  "documents": [
-   "Class 12 marksheet",
-   "Income certificate",
-   "Aadhaar",
-   "Bank account details"
-  ],
-  "apply_url": "https://scholarships.gov.in",
-  "eligibility": {
-   "occupations": [
-    "student"
-   ],
-   "max_income": 450000
-  }
- },
- {
-  "id": "pm-vidyalaxmi",
-  "name": "PM-Vidyalaxmi Education Loan",
-  "aliases": [
-   "vidyalaxmi",
-   "vidya laxmi",
-   "education loan",
-   "एजुकेशन लोन"
-  ],
-  "benefit": "Collateral-free education loans with interest support for eligible students at quality higher-education institutions.",
-  "description": "Single-window scheme for education loans for students admitted to eligible institutions.",
-  "documents": [
-   "Admission letter",
-   "Aadhaar",
-   "Income proof",
-   "Bank account details"
-  ],
-  "apply_url": "https://pmvidyalaxmi.co.in",
-  "eligibility": {
-   "occupations": [
-    "student"
-   ]
-  }
- },
- {
-  "id": "sukanya-samriddhi",
-  "name": "Sukanya Samriddhi Yojana",
-  "aliases": [
-   "sukanya samriddhi",
-   "ssy",
-   "सुकन्या समृद्धि"
-  ],
-  "benefit": "High-interest savings account for a girl child, opened by parents/guardians for her education and marriage expenses.",
-  "description": "Small savings scheme for girls below 10 years of age (account opened by a parent or guardian).",
-  "documents": [
-   "Girl child's birth certificate",
-   "Parent/guardian ID and address proof"
-  ],
-  "apply_url": "https://www.indiapost.gov.in",
-  "eligibility": {
-   "genders": [
-    "female"
-   ],
-   "max_age": 10
-  }
- },
- {
-  "id": "atal-pension",
-  "name": "Atal Pension Yojana",
-  "aliases": [
-   "atal pension",
-   "apy",
-   "अटल पेंशन"
-  ],
-  "benefit": "Guaranteed monthly pension of Rs 1,000 to Rs 5,000 after age 60, depending on contribution.",
-  "description": "Pension scheme mainly for unorganised-sector workers aged 18 to 40 with a savings bank account.",
-  "documents": [
-   "Aadhaar",
-   "Savings bank account",
-   "Mobile number"
-  ],
-  "apply_url": "https://www.pfrda.org.in",
-  "eligibility": {
-   "min_age": 18,
-   "max_age": 40
-  }
- },
- {
-  "id": "pm-sym",
-  "name": "PM Shram Yogi Maan-dhan",
-  "aliases": [
-   "shram yogi",
-   "pm-sym",
-   "maandhan",
-   "श्रम योगी मानधन"
-  ],
-  "benefit": "Assured monthly pension of Rs 3,000 after age 60 for eligible unorganised-sector workers.",
-  "description": "Pension scheme for unorganised workers aged 18-40 with monthly income up to Rs 15,000.",
-  "documents": [
-   "Aadhaar",
-   "Savings bank account / IFSC",
-   "Mobile number"
-  ],
-  "apply_url": "https://maandhan.in",
-  "eligibility": {
-   "occupations": [
-    "worker"
-   ],
-   "min_age": 18,
-   "max_age": 40,
-   "max_income": 180000
-  }
- },
- {
-  "id": "pm-mudra",
-  "name": "PM MUDRA Yojana",
-  "aliases": [
-   "mudra",
-   "mudra loan",
-   "pmmy",
-   "मुद्रा लोन",
-   "मुद्रा योजना"
-  ],
-  "benefit": "Collateral-free business loans (Shishu, Kishor and Tarun categories) for micro and small enterprises.",
-  "description": "Loans for small businesses, traders, shopkeepers and self-employed people.",
-  "documents": [
-   "Aadhaar",
-   "PAN",
-   "Business plan or proof of business",
-   "Bank statements"
-  ],
-  "apply_url": "https://www.mudra.org.in",
-  "eligibility": {
-   "occupations": [
-    "entrepreneur"
-   ],
-   "min_age": 18
-  }
- },
- {
-  "id": "pm-ujjwala",
-  "name": "PM Ujjwala Yojana",
-  "aliases": [
-   "ujjwala",
-   "pmuy",
-   "free lpg",
-   "उज्ज्वला"
-  ],
-  "benefit": "Free LPG connection for women from eligible low-income households.",
-  "description": "Scheme to provide clean cooking fuel connections to women of BPL/eligible households.",
-  "documents": [
-   "Aadhaar",
-   "BPL / ration card",
-   "Bank account details",
-   "Passport-size photo"
-  ],
-  "apply_url": "https://www.pmuy.gov.in",
-  "eligibility": {
-   "genders": [
-    "female"
-   ],
-   "min_age": 18,
-   "requires_bpl": true
-  }
- },
- {
-  "id": "pmay",
-  "name": "PM Awas Yojana (Housing)",
-  "aliases": [
-   "pm awas",
-   "pmay",
-   "awas yojana",
-   "housing scheme",
-   "आवास योजना",
-   "प्रधानमंत्री आवास"
-  ],
-  "benefit": "Financial assistance / interest subsidy for building or buying a house for eligible families.",
-  "description": "Housing scheme with separate urban and rural components; income limits differ by category, so please verify on the portal.",
-  "documents": [
-   "Aadhaar",
-   "Income proof",
-   "Bank account details",
-   "Land/property papers"
-  ],
-  "apply_url": "https://pmaymis.gov.in",
-  "eligibility": {
-   "max_income": 1800000
-  }
- },
- {
-  "id": "nsap-oap",
-  "name": "Indira Gandhi National Old Age Pension (NSAP)",
-  "aliases": [
-   "old age pension",
-   "nsap",
-   "वृद्धावस्था पेंशन",
-   "बुजुर्ग पेंशन"
-  ],
-  "benefit": "Monthly pension for senior citizens from BPL households (amount varies by state top-ups).",
-  "description": "Social pension for elderly persons aged 60+ living below the poverty line.",
-  "documents": [
-   "Aadhaar",
-   "Age proof",
-   "BPL certificate",
-   "Bank account details"
-  ],
-  "apply_url": "https://nsap.nic.in",
-  "eligibility": {
-   "min_age": 60,
-   "requires_bpl": true
-  }
- },
- {
-  "id": "pmkvy",
-  "name": "PM Kaushal Vikas Yojana (Skill Training)",
-  "aliases": [
-   "pmkvy",
-   "kaushal vikas",
-   "skill india",
-   "skill training",
-   "कौशल विकास"
-  ],
-  "benefit": "Free short-term skill training with certification and placement assistance.",
-  "description": "Skill development scheme for youth who are students, school/college dropouts or unemployed.",
-  "documents": [
-   "Aadhaar",
-   "Education certificates",
-   "Bank account details"
-  ],
-  "apply_url": "https://www.skillindiadigital.gov.in",
-  "eligibility": {
-   "min_age": 15,
-   "max_age": 45,
-   "occupations": [
-    "student",
-    "unemployed"
-   ]
-  }
- }
-]
-''')
-
-
-# =========================================================================== #
-# 4. NLP: language detection, intent, entity extraction (offline)
-# =========================================================================== #
-# --------------------------------------------------------------------------- #
-# Language detection
-# --------------------------------------------------------------------------- #
 _SCRIPT_RANGES = [
     ("hi", 0x0900, 0x097F),   # Devanagari (Hindi / Marathi / Nepali)
     ("bn", 0x0980, 0x09FF),
@@ -827,10 +435,8 @@ def merge_profiles(base: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-# --------------------------------------------------------------------------- #
-# Public entry point
-# --------------------------------------------------------------------------- #
 def analyze(text: str) -> NLPResult:
+    """Public NLP entry point (also used by POST /api/nlp/analyze)."""
     language = detect_language(text)
     profile = extract_profile(text)
     intent, confidence = classify_intent(text, profile)
@@ -839,7 +445,8 @@ def analyze(text: str) -> NLPResult:
 
 
 # =========================================================================== #
-# 5. SCHEME MATCHING ENGINE
+# 4. SCHEME MATCHING (used only to give the chatbot context - the public scheme
+#    endpoints belong to the scheme recommendation module)
 # =========================================================================== #
 ESSENTIAL_FIELDS = ["age", "occupation", "annual_income", "category", "state"]
 
@@ -957,8 +564,35 @@ def info_card(scheme: dict[str, Any]) -> dict[str, Any]:
     return _card(scheme, "info", [])
 
 
+# --------------------------------------------------------------------------- #
+# Where the chatbot gets scheme data from.
+# Default: the `schemes` collection in MongoDB (seeded by the scheme module).
+# If the scheme module exposes a service function, plug it in once from
+# app/main.py or chatbot_routes.py:   set_scheme_loader(my_async_function)
+# The function must return a list of dicts in the same shape the matcher uses
+# (id, name, aliases, benefit, description, documents, apply_url, eligibility).
+# --------------------------------------------------------------------------- #
+SchemeLoader = Callable[[], Awaitable[list[dict[str, Any]]]]
+_scheme_loader: Optional[SchemeLoader] = None
+
+
+def set_scheme_loader(loader: Optional[SchemeLoader]) -> None:
+    global _scheme_loader
+    _scheme_loader = loader
+
+
+async def load_schemes() -> list[dict[str, Any]]:
+    if _scheme_loader is not None:
+        try:
+            return await _scheme_loader()
+        except Exception as exc:
+            logging.getLogger("janmitra.chat").error("Scheme loader failed: %s", exc)
+            return []
+    return await chat_store.get_schemes()
+
+
 # =========================================================================== #
-# 6. STORAGE (MongoDB Atlas with in-memory fallback)
+# 5. STORAGE (MongoDB with in-memory fallback)
 # =========================================================================== #
 log_db = logging.getLogger("janmitra.db")
 MAX_MESSAGES = 100
@@ -968,52 +602,76 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class Database:
+class ChatStore:
+    """Conversation storage. Connects lazily on first use, so main.py needs no
+    startup hook. If main.py already owns a Motor database handle, call
+    `chat_store.attach(motor_db)` to reuse it instead of opening a second client."""
+
     def __init__(self) -> None:
         self.client = None
         self.db = None
         self._sessions: dict[str, dict[str, Any]] = {}
-        self._seed_schemes: list[dict[str, Any]] = SEED_SCHEMES
+        self._lock = asyncio.Lock()
+        self._tried = False
 
     @property
     def mode(self) -> str:
         return "mongodb" if self.db is not None else "memory"
 
-    async def connect(self) -> None:
-        s = get_settings()
-        if not s.mongodb_uri:
-            log_db.warning("MONGODB_URI not set - using in-memory storage (data is lost on restart).")
-            return
-        try:
-            from motor.motor_asyncio import AsyncIOMotorClient
+    async def attach(self, motor_db) -> None:
+        """Reuse an existing Motor database (e.g. the one main.py already created)."""
+        self.db, self.client, self._tried = motor_db, None, True
+        await self._ensure_ttl_index()
 
-            client = AsyncIOMotorClient(s.mongodb_uri, serverSelectionTimeoutMS=5000)
-            await client.admin.command("ping")
-            self.client, self.db = client, client[s.mongodb_db]
+    async def _ensure_ttl_index(self) -> None:
+        try:
             await self.db.conversations.create_index(
-                "updated_at", expireAfterSeconds=s.session_ttl_days * 86400)
-            log_db.info("Connected to MongoDB database '%s'.", s.mongodb_db)
-        except Exception as exc:  # network, auth, missing package ...
-            log_db.error("MongoDB unavailable (%s) - falling back to in-memory storage.", exc)
-            self.client, self.db = None, None
+                "updated_at", expireAfterSeconds=get_chatbot_settings().session_ttl_days * 86400)
+        except Exception as exc:
+            log_db.error("Could not create TTL index: %s", exc)
+
+    async def ensure_connected(self) -> None:
+        if self._tried:
+            return
+        async with self._lock:
+            if self._tried:
+                return
+            self._tried = True
+            s = get_chatbot_settings()
+            if not s.mongodb_uri:
+                log_db.warning("MONGODB_URI not set - chat history kept in memory (lost on restart).")
+                return
+            try:
+                from motor.motor_asyncio import AsyncIOMotorClient
+
+                client = AsyncIOMotorClient(s.mongodb_uri, serverSelectionTimeoutMS=5000)
+                await client.admin.command("ping")
+                self.client, self.db = client, client[s.mongodb_db]
+                await self._ensure_ttl_index()
+                log_db.info("Chat storage connected to MongoDB database '%s'.", s.mongodb_db)
+            except Exception as exc:  # network, auth, missing package ...
+                log_db.error("MongoDB unavailable (%s) - chat history kept in memory.", exc)
+                self.client, self.db = None, None
 
     async def close(self) -> None:
+        """Only closes a client this module opened itself (not one passed to attach())."""
         if self.client is not None:
             self.client.close()
+            self.client = None
 
-    # ---- schemes ---------------------------------------------------------- #
+    # ---- schemes (read-only; owned by the scheme module) ------------------ #
     async def get_schemes(self) -> list[dict[str, Any]]:
+        await self.ensure_connected()
         if self.db is not None:
             try:
-                docs = await self.db.schemes.find({}, {"_id": 0}).to_list(length=1000)
-                if docs:
-                    return docs
+                return await self.db.schemes.find({}, {"_id": 0}).to_list(length=1000)
             except Exception as exc:
                 log_db.error("Reading schemes failed: %s", exc)
-        return self._seed_schemes
+        return []
 
     # ---- conversations ---------------------------------------------------- #
     async def get_session(self, session_id: str) -> Optional[dict[str, Any]]:
+        await self.ensure_connected()
         if self.db is not None:
             try:
                 return await self.db.conversations.find_one({"_id": session_id})
@@ -1024,6 +682,7 @@ class Database:
 
     async def save_turn(self, session_id: str, user_msg: str, bot_msg: str,
                         profile: dict[str, Any], language: str, intent: str) -> None:
+        await self.ensure_connected()
         now = _now()
         messages = [{"role": "user", "content": user_msg, "ts": now},
                     {"role": "model", "content": bot_msg, "ts": now}]
@@ -1036,26 +695,26 @@ class Database:
                      "$push": {"messages": {"$each": messages, "$slice": -MAX_MESSAGES}}},
                     upsert=True,
                 )
-                return
             except Exception as exc:
                 log_db.error("save_turn failed: %s", exc)
-                return
+            return
         doc = self._sessions.setdefault(session_id, {"_id": session_id, "messages": [], "created_at": now})
         doc.update({"profile": profile, "language": language, "last_intent": intent, "updated_at": now})
         doc["messages"] = (doc["messages"] + messages)[-MAX_MESSAGES:]
 
     async def delete_session(self, session_id: str) -> None:
+        await self.ensure_connected()
         if self.db is not None:
             await self.db.conversations.delete_one({"_id": session_id})
         else:
             self._sessions.pop(session_id, None)
 
 
-db = Database()
+chat_store = ChatStore()
 
 
 # =========================================================================== #
-# 7. GEMINI API WRAPPER
+# 6. GEMINI API WRAPPER
 # =========================================================================== #
 log_gemini = logging.getLogger("janmitra.gemini")
 
@@ -1071,7 +730,7 @@ class GeminiService:
 
     @property
     def enabled(self) -> bool:
-        return bool(get_settings().gemini_api_key)
+        return bool(get_chatbot_settings().gemini_api_key)
 
     def _ensure_client(self):
         if self._client is None:
@@ -1080,7 +739,7 @@ class GeminiService:
                 from google.genai import types
             except ImportError as exc:
                 raise GeminiUnavailable("google-genai package is not installed") from exc
-            self._client = genai.Client(api_key=get_settings().gemini_api_key)
+            self._client = genai.Client(api_key=get_chatbot_settings().gemini_api_key)
             self._types = types
         return self._client, self._types
 
@@ -1088,7 +747,7 @@ class GeminiService:
                        retries: int = 2) -> str:
         if not self.enabled:
             raise GeminiUnavailable("GEMINI_API_KEY is not set")
-        s = get_settings()
+        s = get_chatbot_settings()
         client, types = self._ensure_client()
 
         contents = [
@@ -1125,7 +784,7 @@ gemini = GeminiService()
 
 
 # =========================================================================== #
-# 8. CHAT ORCHESTRATION
+# 7. CHAT ORCHESTRATION
 # =========================================================================== #
 log_chat = logging.getLogger("janmitra.chat")
 
@@ -1241,7 +900,7 @@ def _history_for_model(session: dict | None, limit: int = 10) -> list[dict]:
 # --------------------------------- main flow --------------------------------- #
 async def handle_message(req: ChatRequest) -> dict:
     session_id = req.session_id or uuid.uuid4().hex
-    session = await db.get_session(session_id)
+    session = await chat_store.get_session(session_id)
 
     profile = dict((session or {}).get("profile") or {})
     if req.profile:
@@ -1251,7 +910,7 @@ async def handle_message(req: ChatRequest) -> dict:
     profile = merge_profiles(profile, result.profile)
     intent, confidence = result.intent, result.confidence
 
-    schemes = await db.get_schemes()
+    schemes = await load_schemes()
     mentioned = find_mentioned(req.message, schemes)
 
     last_intent = (session or {}).get("last_intent")
@@ -1287,7 +946,7 @@ async def handle_message(req: ChatRequest) -> dict:
         action = {"type": "open_complaint_form", "route": "/report-issue",
                   "category": result.complaint_category, "description": req.message}
 
-    await db.save_turn(session_id, req.message, reply, profile, language, intent)
+    await chat_store.save_turn(session_id, req.message, reply, profile, language, intent)
 
     return dict(
         session_id=session_id, reply=reply, language=language, intent=intent,
@@ -1296,110 +955,31 @@ async def handle_message(req: ChatRequest) -> dict:
     )
 
 
-# =========================================================================== #
-# 9. WEB APP (FastAPI) + built-in chat page
-# =========================================================================== #
-_rate_hits: dict[str, deque] = defaultdict(deque)
-
-
-async def rate_limit(request: Request) -> None:
-    ip = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    window = _rate_hits[ip]
-    while window and now - window[0] > 60:
-        window.popleft()
-    if len(window) >= get_settings().rate_limit_per_minute:
-        raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
-    window.append(now)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await db.connect()
-    yield
-    await db.close()
-
-
-app = FastAPI(title="JanMitra AI - Chatbot & NLP", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=get_settings().cors_origins,
-                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "storage": db.mode, "gemini_configured": gemini.enabled}
-
-
-@app.post("/api/chat/message", response_model=ChatResponse, dependencies=[Depends(rate_limit)])
-async def chat_message(req: ChatRequest):
-    """Main endpoint. The voice module can send its speech-to-text transcript here."""
-    return await handle_message(req)
-
-
-@app.get("/api/chat/history/{session_id}")
-async def chat_history(session_id: str):
-    if not (8 <= len(session_id) <= 64):
-        raise HTTPException(status_code=400, detail="Invalid session id")
-    session = await db.get_session(session_id)
+async def get_history(session_id: str) -> dict:
+    session = await chat_store.get_session(session_id)
     if not session:
         return {"session_id": session_id, "messages": [], "profile": {}}
     msgs = [{"role": m["role"], "content": m["content"]} for m in session.get("messages", [])]
     return {"session_id": session_id, "messages": msgs, "profile": session.get("profile", {})}
 
 
-@app.delete("/api/chat/session/{session_id}")
-async def delete_session(session_id: str):
-    if not (8 <= len(session_id) <= 64):
-        raise HTTPException(status_code=400, detail="Invalid session id")
-    await db.delete_session(session_id)
-    return {"deleted": True}
-
-
-@app.post("/api/nlp/analyze", dependencies=[Depends(rate_limit)])
-async def nlp_analyze(req: AnalyzeRequest):
-    r = analyze(req.text)
-    return {"language": r.language, "intent": r.intent, "confidence": r.confidence,
-            "profile": r.profile, "complaint_category": r.complaint_category}
-
-
-@app.get("/api/schemes")
-async def list_schemes():
-    return await db.get_schemes()
-
-
-@app.post("/api/schemes/recommend")
-async def recommend(profile: UserProfile):
-    return match_schemes(profile.model_dump(exclude_none=True), await db.get_schemes(), limit=10)
-
-
-@app.post("/api/admin/seed-schemes")
-async def seed_schemes_to_mongo():
-    """Copy the built-in schemes into MongoDB (only works when MONGODB_URI is connected)."""
-    if db.db is None:
-        raise HTTPException(status_code=400, detail="MongoDB is not connected.")
-    for s in SEED_SCHEMES:
-        await db.db.schemes.replace_one({"id": s["id"]}, s, upsert=True)
-    return {"seeded": len(SEED_SCHEMES)}
-
-
-@app.get("/", include_in_schema=False)
-async def root():
-    return {"service": "JanMitra AI chatbot & NLP", "docs": "/docs", "chat_endpoint": "POST /api/chat/message"}
+async def delete_session(session_id: str) -> None:
+    await chat_store.delete_session(session_id)
 
 
 # =========================================================================== #
-# 10. RUN: terminal chat (default) or API server (--serve)
+# 8. TERMINAL CHAT (dev helper): python -m backend.app.services.chatbot_service
 # =========================================================================== #
 async def terminal_chat() -> None:
     """Chat with the bot right in the VS Code terminal - no frontend needed."""
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")       # Hindi text on Windows terminals
     logging.getLogger("janmitra").setLevel(logging.CRITICAL)
-    await db.connect()
+    await chat_store.ensure_connected()
     print("\n" + "=" * 62)
     print("  JanMitra AI - terminal chat")
-    print(f"  Replies : {'Gemini (' + get_settings().gemini_model + ')' if gemini.enabled else 'rule-based fallback (no GEMINI_API_KEY)'}")
-    print(f"  Storage : {db.mode}")
+    print(f"  Replies : {'Gemini (' + get_chatbot_settings().gemini_model + ')' if gemini.enabled else 'rule-based fallback (no GEMINI_API_KEY)'}")
+    print(f"  Storage : {chat_store.mode}")
     print("  Commands: /profile  /new  /exit")
     print("=" * 62)
     print("  Try: I am a 21 year old OBC student, income 2 lakh")
@@ -1443,16 +1023,8 @@ async def terminal_chat() -> None:
         if r["action"]:
             print(f"   -> action for frontend: {json.dumps(r['action'], ensure_ascii=False)}")
         print(f"   (intent={r['intent']}, language={r['language']}, source={r['source']})\n")
-    await db.close()
+    await chat_store.close()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="JanMitra AI chatbot & NLP")
-    parser.add_argument("--serve", action="store_true", help="start the REST API server instead of terminal chat")
-    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
-    args = parser.parse_args()
-    if args.serve:
-        print(f"\n  API running -> http://localhost:{args.port}/docs   (POST /api/chat/message)\n")
-        uvicorn.run(app, host="127.0.0.1", port=args.port)
-    else:
-        asyncio.run(terminal_chat())
+    asyncio.run(terminal_chat())
